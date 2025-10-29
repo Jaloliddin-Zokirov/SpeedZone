@@ -645,16 +645,16 @@ function SpeedGauge({
             </div>
           )}
         </div>
-        {!showButton ? (
+        {/* {!showButton ? (
           <div className="pointer-events-none absolute inset-[12%] flex items-center justify-center">
             <div
-              className="relative h-[48%] w-1.5 origin-bottom rounded-full bg-gradient-to-b from-slate-100 via-indigo-200 to-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.6)]"
+              className="relative h-[48%] w-1.5 transition-transform ease-out origin-bottom rounded-full bg-gradient-to-b from-slate-100 via-indigo-200 to-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.6)]"
               style={{ transform: `rotate(${angle}deg)` }}
             >
               <span className="absolute -top-2 left-1/2 h-3 w-3 -translate-x-1/2 rounded-full bg-indigo-200 shadow-[0_0_10px_rgba(129,140,248,0.8)]" />
             </div>
           </div>
-        ) : null}
+        ) : null} */}
         <div className="pointer-events-none absolute inset-x-8 bottom-10 flex justify-between text-xs uppercase tracking-[0.3em] text-slate-500">
           <span>0</span>
           <span>{Math.round(max)}</span>
@@ -943,12 +943,12 @@ export default function Page() {
         <header className="flex flex-col gap-6 rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur md:flex-row md:items-center md:justify-between">
           <div className="flex items-center gap-4">
             <div className="flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 via-sky-500 to-fuchsia-500 text-2xl font-semibold shadow-[0_10px_40px_rgba(79,70,229,0.35)]">
-              ST
+              ZS
             </div>
             <div>
-              <p className="text-xs uppercase tracking-[0.45em] text-slate-400">Speedtest Replica</p>
+              <p className="text-xs uppercase tracking-[0.45em] text-slate-400">ZSpeed — Internet Speed Test</p>
               <h1 className="mt-1 text-3xl font-semibold tracking-tight text-white sm:text-4xl">
-                Network Performance Diagnostics
+                Measure Ping, Download, and Upload in Real Time
               </h1>
             </div>
           </div>
