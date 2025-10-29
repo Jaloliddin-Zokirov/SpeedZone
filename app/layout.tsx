@@ -6,8 +6,8 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"], display: "swap" });
 
 export const metadata: Metadata = {
-  title: "ZSpeed — Internet Speed Test for Ping, Download, and Upload",
-  description: "ZSpeed is a modern internet speed testing platform that allows users to measure real-time ping (latency), download, and upload performance with precision. Built with Next.js, ZSpeed delivers accurate, reliable, and visually engaging results. Whether you want to verify your ISP’s performance, compare network stability, or analyze data transfer speeds, ZSpeed provides a fast and intuitive way to understand your internet connection quality.",
+  title: "SpeedZone — Internet Speed Test for Ping, Download, and Upload",
+  description: "SpeedZone is a modern internet speed testing platform that allows users to measure real-time ping (latency), download, and upload performance with precision. Built with Next.js, SpeedZone delivers accurate, reliable, and visually engaging results. Whether you want to verify your ISP’s performance, compare network stability, or analyze data transfer speeds, SpeedZone provides a fast and intuitive way to understand your internet connection quality.",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

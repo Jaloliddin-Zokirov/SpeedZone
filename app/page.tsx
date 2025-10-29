@@ -31,10 +31,10 @@ const SERVER_POOL: ServerInfo[] = [
     city: 'Automatic',
     country: 'Nearest Cloudflare POP',
     provider: 'Cloudflare',
-    downloadUrl: process.env.NEXT_PUBLIC_ZSPEED_DOWNLOAD_URL ?? DEFAULT_REMOTE_DOWNLOAD_URL,
-    uploadUrl: process.env.NEXT_PUBLIC_ZSPEED_UPLOAD_URL ?? DEFAULT_REMOTE_UPLOAD_URL,
+    downloadUrl: process.env.NEXT_PUBLIC_SpeedZone_DOWNLOAD_URL ?? DEFAULT_REMOTE_DOWNLOAD_URL,
+    uploadUrl: process.env.NEXT_PUBLIC_SpeedZone_UPLOAD_URL ?? DEFAULT_REMOTE_UPLOAD_URL,
     downloadBytes:
-      Number(process.env.NEXT_PUBLIC_ZSPEED_DOWNLOAD_BYTES ?? DEFAULT_REMOTE_DOWNLOAD_BYTES) ||
+      Number(process.env.NEXT_PUBLIC_SpeedZone_DOWNLOAD_BYTES ?? DEFAULT_REMOTE_DOWNLOAD_BYTES) ||
       DEFAULT_REMOTE_DOWNLOAD_BYTES,
     metaUrl: 'https://speed.cloudflare.com/meta',
   },
@@ -679,7 +679,7 @@ function SpeedGauge({
               <span className="rounded-full border border-white/10 bg-white/5 px-6 py-3 text-lg font-medium uppercase tracking-[0.5em] text-white/90 transition group-hover:scale-105 group-disabled:opacity-40">
                 {buttonLabel}
               </span>
-              <span className="text-xs uppercase tracking-[0.35em] text-slate-500">ZSpeed</span>
+              <span className="text-xs uppercase tracking-[0.35em] text-slate-500">SpeedZone</span>
             </button>
           ) : (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
@@ -1021,7 +1021,7 @@ export default function Page() {
               ZS
             </div> */}
             <div>
-              <p className="text-xs uppercase tracking-[0.45em] text-slate-400">ZSpeed — Internet Speed Test</p>
+              <p className="text-xs uppercase tracking-[0.45em] text-slate-400">SpeedZone — Internet Speed Test</p>
               <h1 className="mt-1 text-3xl font-semibold tracking-tight text-white sm:text-4xl">
                 Measure Ping, Download, and Upload in Real Time
               </h1>
