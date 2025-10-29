@@ -11,18 +11,55 @@ type ProgressState = {
 };
 
 type ServerInfo = {
+  id: string;
   city: string;
   country: string;
   provider: string;
+  downloadUrl?: string;
+  uploadUrl?: string;
+  downloadBytes?: number;
+  metaUrl?: string;
 };
 
+const DEFAULT_REMOTE_DOWNLOAD_URL = 'https://speed.cloudflare.com/__down';
+const DEFAULT_REMOTE_UPLOAD_URL = 'https://speed.cloudflare.com/__up';
+const DEFAULT_REMOTE_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+
 const SERVER_POOL: ServerInfo[] = [
-  { city: 'Tashkent', country: 'Uzbekistan', provider: 'Uztelecom' },
-  { city: 'Samarkand', country: 'Uzbekistan', provider: 'UMS Mobile' },
-  { city: 'Namangan', country: 'Uzbekistan', provider: 'Ucell' },
-  { city: 'Almaty', country: 'Kazakhstan', provider: 'Beeline' },
-  { city: 'Frankfurt', country: 'Germany', provider: 'Hetzner' },
+  {
+    id: 'cloudflare-auto',
+    city: 'Automatic',
+    country: 'Nearest Cloudflare POP',
+    provider: 'Cloudflare',
+    downloadUrl: process.env.NEXT_PUBLIC_ZSPEED_DOWNLOAD_URL ?? DEFAULT_REMOTE_DOWNLOAD_URL,
+    uploadUrl: process.env.NEXT_PUBLIC_ZSPEED_UPLOAD_URL ?? DEFAULT_REMOTE_UPLOAD_URL,
+    downloadBytes:
+      Number(process.env.NEXT_PUBLIC_ZSPEED_DOWNLOAD_BYTES ?? DEFAULT_REMOTE_DOWNLOAD_BYTES) ||
+      DEFAULT_REMOTE_DOWNLOAD_BYTES,
+    metaUrl: 'https://speed.cloudflare.com/meta',
+  },
+  { id: 'tashkent-uztelecom', city: 'Tashkent', country: 'Uzbekistan', provider: 'Uztelecom' },
+  { id: 'samarkand-ums', city: 'Samarkand', country: 'Uzbekistan', provider: 'UMS Mobile' },
+  { id: 'namangan-ucell', city: 'Namangan', country: 'Uzbekistan', provider: 'Ucell' },
+  { id: 'almaty-beeline', city: 'Almaty', country: 'Kazakhstan', provider: 'Beeline' },
+  { id: 'frankfurt-hetzner', city: 'Frankfurt', country: 'Germany', provider: 'Hetzner' },
 ];
+
+const PRIMARY_SERVER = SERVER_POOL[0] ?? {
+  id: 'default',
+  city: 'Auto',
+  country: 'Unknown',
+  provider: 'speed.cloudflare.com',
+  downloadUrl: DEFAULT_REMOTE_DOWNLOAD_URL,
+  uploadUrl: DEFAULT_REMOTE_UPLOAD_URL,
+  downloadBytes: DEFAULT_REMOTE_DOWNLOAD_BYTES,
+  metaUrl: 'https://speed.cloudflare.com/meta',
+};
+
+const DEFAULT_DOWNLOAD_URL = PRIMARY_SERVER.downloadUrl ?? DEFAULT_REMOTE_DOWNLOAD_URL;
+const DEFAULT_UPLOAD_URL = PRIMARY_SERVER.uploadUrl ?? DEFAULT_REMOTE_UPLOAD_URL;
+const DEFAULT_DOWNLOAD_BYTES = PRIMARY_SERVER.downloadBytes ?? DEFAULT_REMOTE_DOWNLOAD_BYTES;
+const DEFAULT_REMOTE_HOST = extractHost(DEFAULT_DOWNLOAD_URL);
 
 type NetworkInfo = {
   ip: string | null;
@@ -51,18 +88,6 @@ type SpeedProgress = (mbps: number, fraction: number) => void;
 
 const SPEED_SCALES = [25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000];
 
-const DEFAULT_REMOTE_DOWNLOAD_URL = 'https://speed.cloudflare.com/__down';
-const DEFAULT_REMOTE_UPLOAD_URL = 'https://speed.cloudflare.com/__up';
-const DEFAULT_REMOTE_DOWNLOAD_BYTES = 200 * 1024 * 1024;
-
-const REMOTE_DOWNLOAD_URL =
-  process.env.NEXT_PUBLIC_SPEEDTEST_DOWNLOAD_URL ?? DEFAULT_REMOTE_DOWNLOAD_URL;
-const REMOTE_UPLOAD_URL =
-  process.env.NEXT_PUBLIC_SPEEDTEST_UPLOAD_URL ?? DEFAULT_REMOTE_UPLOAD_URL;
-const REMOTE_DOWNLOAD_BYTES = Number(
-  process.env.NEXT_PUBLIC_SPEEDTEST_DOWNLOAD_BYTES ?? DEFAULT_REMOTE_DOWNLOAD_BYTES
-) || DEFAULT_REMOTE_DOWNLOAD_BYTES;
-const REMOTE_DOWNLOAD_HOST = extractHost(REMOTE_DOWNLOAD_URL);
 const STATUS_DETAIL: Record<Phase, string> = {
   idle: 'Click go to verify your connection performance.',
   ping: 'Finding the best route and measuring latency.',
@@ -184,21 +209,30 @@ async function measurePing({
   return { average, jitter, samples: filtered };
 }
 
-async function openDownloadStream(signal: AbortSignal, chunkSize: number) {
+async function openDownloadStream(
+  signal: AbortSignal,
+  chunkSize: number,
+  remoteUrl: string | null | undefined,
+  remoteBytes: number
+) {
   const cacheBust = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const remoteUrl = new URL(REMOTE_DOWNLOAD_URL);
-  remoteUrl.searchParams.set('bytes', String(REMOTE_DOWNLOAD_BYTES));
-  remoteUrl.searchParams.set('cacheBust', cacheBust);
-  try {
-    const remoteResponse = await fetch(remoteUrl.toString(), { signal, cache: 'no-store' });
-    if (remoteResponse.ok && remoteResponse.body) {
-      return remoteResponse;
+  const remoteTarget = remoteUrl?.trim().length ? remoteUrl.trim() : null;
+
+  if (remoteTarget) {
+    try {
+      const inbound = new URL(remoteTarget);
+      inbound.searchParams.set('bytes', String(remoteBytes));
+      inbound.searchParams.set('cacheBust', cacheBust);
+      const remoteResponse = await fetch(inbound.toString(), { signal, cache: 'no-store' });
+      if (remoteResponse.ok && remoteResponse.body) {
+        return remoteResponse;
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      console.warn('External download endpoint failed, falling back to local stream.', err);
     }
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw err;
-    }
-    console.warn('External download endpoint failed, falling back to local stream.', err);
   }
 
   const fallbackUrl = `/api/download?bytes=0&chunk=${chunkSize}&cacheBust=${cacheBust}`;
@@ -216,11 +250,15 @@ async function measureDownload({
   durationMs = 17_000,
   concurrency = 4,
   chunkSize = 256 * 1024,
+  remoteUrl,
+  remoteBytes = DEFAULT_REMOTE_DOWNLOAD_BYTES,
   onProgress,
 }: {
   durationMs?: number;
   concurrency?: number;
   chunkSize?: number;
+  remoteUrl?: string | null;
+  remoteBytes?: number;
   onProgress?: SpeedProgress;
 } = {}) {
   const duration = Math.max(Math.floor(durationMs), 1_000);
@@ -262,7 +300,7 @@ async function measureDownload({
     const controller = new AbortController();
     controllers.add(controller);
     try {
-      const res = await openDownloadStream(controller.signal, safeChunkSize);
+      const res = await openDownloadStream(controller.signal, safeChunkSize, remoteUrl, remoteBytes);
       const stream = res.body;
       if (!stream) {
         throw new Error('Download stream unavailable');
@@ -340,11 +378,13 @@ async function measureUpload({
   durationMs = 17_000,
   concurrency = 3,
   payloadBytes = 512 * 1024,
+  remoteUrl,
   onProgress,
 }: {
   durationMs?: number;
   concurrency?: number;
   payloadBytes?: number;
+  remoteUrl?: string | null;
   onProgress?: SpeedProgress;
 } = {}) {
   const duration = Math.max(Math.floor(durationMs), 1_000);
@@ -357,7 +397,8 @@ async function measureUpload({
   const stopTime = start + duration;
   let stop = false;
   let totalUploaded = 0;
-  let preferRemoteUpload = true;
+  const remoteEndpoint = remoteUrl?.trim().length ? remoteUrl.trim() : null;
+  let preferRemoteUpload = Boolean(remoteEndpoint);
 
   const timer = window.setTimeout(() => {
     stop = true;
@@ -411,12 +452,16 @@ async function measureUpload({
           complete();
           return;
         }
+        if (mode === 'remote' && !remoteEndpoint) {
+          setTimeout(() => dispatchUpload('local'), 0);
+          return;
+        }
 
         const payload = makeRandomPayload(chunkBytes);
         const cacheBust = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
         const url =
           mode === 'remote'
-            ? `${REMOTE_UPLOAD_URL}?cacheBust=${cacheBust}`
+            ? `${remoteEndpoint}?cacheBust=${cacheBust}`
             : `/api/upload?cacheBust=${cacheBust}`;
 
         const xhr = new XMLHttpRequest();
@@ -634,7 +679,7 @@ function SpeedGauge({
               <span className="rounded-full border border-white/10 bg-white/5 px-6 py-3 text-lg font-medium uppercase tracking-[0.5em] text-white/90 transition group-hover:scale-105 group-disabled:opacity-40">
                 {buttonLabel}
               </span>
-              <span className="text-xs uppercase tracking-[0.35em] text-slate-500">Speedtest</span>
+              <span className="text-xs uppercase tracking-[0.35em] text-slate-500">ZSpeed</span>
             </button>
           ) : (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
@@ -698,15 +743,28 @@ export default function Page() {
     error: null,
   });
   const [endpointInfo, setEndpointInfo] = useState<EndpointInfo>({
-    host: REMOTE_DOWNLOAD_HOST,
+    host: DEFAULT_REMOTE_HOST,
     colo: null,
     city: null,
     region: null,
     country: null,
-    loading: REMOTE_DOWNLOAD_HOST.includes('speed.cloudflare.com'),
+    loading: Boolean(PRIMARY_SERVER.metaUrl),
     error: null,
   });
+  const [selectedServerId, setSelectedServerId] = useState(PRIMARY_SERVER.id);
+  const [isServerPickerOpen, setServerPickerOpen] = useState(false);
   const runRef = useRef(0);
+
+  const selectedServer = useMemo<ServerInfo>(() => {
+    const match = SERVER_POOL.find((entry) => entry.id === selectedServerId);
+    return match ?? PRIMARY_SERVER;
+  }, [selectedServerId]);
+
+  const selectedDownloadUrl = selectedServer.downloadUrl ?? DEFAULT_DOWNLOAD_URL;
+  const selectedUploadUrl = selectedServer.uploadUrl ?? DEFAULT_UPLOAD_URL;
+  const selectedDownloadBytes = selectedServer.downloadBytes ?? DEFAULT_DOWNLOAD_BYTES;
+  const selectedMetaUrl = selectedServer.metaUrl ?? null;
+  const selectedHost = useMemo(() => extractHost(selectedDownloadUrl), [selectedDownloadUrl]);
 
   useEffect(() => {
     let cancelled = false;
@@ -756,10 +814,23 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
+    setEndpointInfo({
+      host: selectedHost,
+      colo: null,
+      city: null,
+      region: null,
+      country: null,
+      loading: Boolean(selectedMetaUrl),
+      error: null,
+    });
+  }, [selectedHost, selectedMetaUrl]);
+
+  useEffect(() => {
     let cancelled = false;
-    if (!REMOTE_DOWNLOAD_HOST.includes('speed.cloudflare.com')) {
+    if (!selectedMetaUrl) {
       setEndpointInfo((prev) => ({
         ...prev,
+        host: selectedHost,
         loading: false,
         error: null,
       }));
@@ -767,32 +838,35 @@ export default function Page() {
         cancelled = true;
       };
     }
+    const metaUrl = selectedMetaUrl;
     async function fetchEndpointMeta() {
       try {
-        const response = await fetch('https://speed.cloudflare.com/meta', { cache: 'no-store' });
+        const response = await fetch(metaUrl, { cache: 'no-store' });
         if (!response.ok) {
           throw new Error(`Lookup failed with status ${response.status}`);
         }
         const data = await response.json();
         if (cancelled) return;
-        setEndpointInfo({
-          host: REMOTE_DOWNLOAD_HOST,
+        setEndpointInfo((prev) => ({
+          ...prev,
+          host: selectedHost,
           colo: data.colo ?? null,
           city: data.city ?? null,
           region: data.region ?? null,
           country: data.country ?? null,
           loading: false,
           error: null,
-        });
+        }));
       } catch (err) {
         if (cancelled) return;
         setEndpointInfo((prev) => ({
           ...prev,
+          host: selectedHost,
           loading: false,
           error:
             err instanceof Error
-              ? `Unable to resolve Cloudflare test location: ${err.message}`
-              : 'Unable to resolve Cloudflare test location',
+              ? `Unable to resolve remote test location: ${err.message}`
+              : 'Unable to resolve remote test location',
         }));
       }
     }
@@ -800,28 +874,26 @@ export default function Page() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [selectedMetaUrl, selectedHost]);
 
-  const server = useMemo<ServerInfo>(() => {
-    if (endpointInfo.city || endpointInfo.colo || endpointInfo.country) {
-      return {
-        city: endpointInfo.city ?? endpointInfo.colo ?? 'Unknown',
-        country: endpointInfo.country ?? 'Unknown',
-        provider: endpointInfo.host,
-      };
-    }
-    if (networkInfo.country) {
-      const normalized = networkInfo.country.toLowerCase();
-      const match =
-        SERVER_POOL.find((entry) => entry.country.toLowerCase() === normalized) ?? null;
-      if (match) return match;
-    }
+  const serverDisplay = useMemo<ServerInfo>(() => {
+    const providerLabel =
+      selectedServer.provider.trim().length > 0 ? selectedServer.provider : selectedHost;
     return {
-      city: 'Unknown',
-      country: 'Unknown',
-      provider: endpointInfo.host,
+      ...selectedServer,
+      provider: providerLabel,
+      city: endpointInfo.city ?? endpointInfo.colo ?? selectedServer.city,
+      country: endpointInfo.country ?? selectedServer.country,
     };
-  }, [endpointInfo, networkInfo.country]);
+  }, [endpointInfo.city, endpointInfo.colo, endpointInfo.country, selectedHost, selectedServer]);
+  const hostLabel = endpointInfo.host ?? selectedHost;
+  const remoteConfigured = Boolean(
+    selectedServer.downloadUrl?.trim() && selectedServer.uploadUrl?.trim()
+  );
+  const handleServerSelect = useCallback((id: string) => {
+    setSelectedServerId(id);
+    setServerPickerOpen(false);
+  }, []);
 
   const startTest = useCallback(async () => {
     if (running) return;
@@ -858,6 +930,8 @@ export default function Page() {
         durationMs: 17_000,
         concurrency: 4,
         chunkSize: 256 * 1024,
+        remoteUrl: selectedDownloadUrl,
+        remoteBytes: selectedDownloadBytes,
         onProgress: (mbps, fraction) => {
           if (runRef.current !== runId) return;
           setLiveValue(mbps);
@@ -875,6 +949,7 @@ export default function Page() {
         durationMs: 17_000,
         concurrency: 3,
         payloadBytes: 512 * 1024,
+        remoteUrl: selectedUploadUrl,
         onProgress: (mbps, fraction) => {
           if (runRef.current !== runId) return;
           setLiveValue(mbps);
@@ -898,7 +973,7 @@ export default function Page() {
         setRunning(false);
       }
     }
-  }, [running]);
+  }, [running, selectedDownloadUrl, selectedDownloadBytes, selectedUploadUrl]);
 
   const gaugeUnit = phase === 'ping' ? 'ms' : 'Mbps';
   const gaugeMax = phase === 'ping' ? 250 : speedScale;
@@ -942,9 +1017,9 @@ export default function Page() {
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-12">
         <header className="flex flex-col gap-6 rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur md:flex-row md:items-center md:justify-between">
           <div className="flex items-center gap-4">
-            <div className="flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 via-sky-500 to-fuchsia-500 text-2xl font-semibold shadow-[0_10px_40px_rgba(79,70,229,0.35)]">
+            {/* <div className="flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 via-sky-500 to-fuchsia-500 text-2xl font-semibold shadow-[0_10px_40px_rgba(79,70,229,0.35)]">
               ZS
-            </div>
+            </div> */}
             <div>
               <p className="text-xs uppercase tracking-[0.45em] text-slate-400">ZSpeed — Internet Speed Test</p>
               <h1 className="mt-1 text-3xl font-semibold tracking-tight text-white sm:text-4xl">
@@ -977,8 +1052,27 @@ export default function Page() {
                   })}
             </div>
             <div className="uppercase tracking-[0.25em] text-slate-400">Test Server</div>
-            <div className="font-medium text-white">
-              {server.city}, {server.country} - {server.provider}
+            <div className="font-medium text-white flex flex-wrap items-center gap-3">
+              <span className="leading-tight">
+                {serverDisplay.city}, {serverDisplay.country} - {serverDisplay.provider}
+              </span>
+              <span
+                className={[
+                  'rounded-full border px-2 py-0.5 text-[0.65rem] uppercase tracking-[0.35em]',
+                  remoteConfigured
+                    ? 'border-emerald-400/40 text-emerald-200'
+                    : 'border-amber-300/40 text-amber-200',
+                ].join(' ')}
+              >
+                {remoteConfigured ? 'Remote Ready' : 'Local Fallback'}
+              </span>
+              <button
+                type="button"
+                onClick={() => setServerPickerOpen(true)}
+                className="rounded-full border border-white/15 px-3 py-1 text-xs font-semibold uppercase tracking-[0.3em] text-indigo-200 transition hover:border-indigo-300/60 hover:text-white focus:outline-none focus:ring-2 focus:ring-indigo-400/60"
+              >
+                Change
+              </button>
             </div>
             {networkInfo.error ? (
               <div className="sm:col-span-2 text-xs uppercase tracking-[0.2em] text-amber-200/80">
@@ -1080,7 +1174,7 @@ export default function Page() {
                 <div className="flex justify-between gap-4">
                   <dt className="uppercase tracking-[0.3em] text-slate-500">Server</dt>
                   <dd className="text-right">
-                    {server.city}, {server.country}
+                    {serverDisplay.city}, {serverDisplay.country}
                   </dd>
                 </div>
                 {endpointInfo.colo ? (
@@ -1091,7 +1185,7 @@ export default function Page() {
                 ) : null}
                 <div className="flex justify-between gap-4">
                   <dt className="uppercase tracking-[0.3em] text-slate-500">Host</dt>
-                  <dd className="text-right">{server.provider}</dd>
+                  <dd className="text-right">{hostLabel}</dd>
                 </div>
                 <div className="flex justify-between gap-4">
                   <dt className="uppercase tracking-[0.3em] text-slate-500">Connection</dt>
@@ -1114,6 +1208,92 @@ export default function Page() {
           </aside>
         </div>
       </div>
+      {isServerPickerOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 backdrop-blur"
+          onClick={() => setServerPickerOpen(false)}
+        >
+          <div
+            className="relative mx-4 w-full max-w-2xl rounded-3xl border border-white/10 bg-slate-900/95 p-6 shadow-[0_40px_120px_-60px_rgba(99,102,241,0.6)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-semibold text-white">Choose Test Server</h2>
+                <p className="mt-1 text-xs uppercase tracking-[0.3em] text-slate-400">
+                  Configure real endpoints you operate before running tests
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setServerPickerOpen(false)}
+                className="rounded-full border border-white/15 px-3 py-1 text-xs font-semibold uppercase tracking-[0.3em] text-slate-300 transition hover:border-slate-200/60 hover:text-white focus:outline-none focus:ring-2 focus:ring-indigo-400/60"
+              >
+                Close
+              </button>
+            </div>
+            <div className="mt-5 max-h-80 space-y-3 overflow-y-auto pr-1">
+              {SERVER_POOL.map((option) => {
+                const isSelected = option.id === selectedServer.id;
+                const remoteConfigured =
+                  Boolean(option.downloadUrl?.trim() && option.uploadUrl?.trim());
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => handleServerSelect(option.id)}
+                    className={[
+                      'w-full rounded-2xl border px-4 py-4 text-left transition focus:outline-none focus:ring-2 focus:ring-indigo-400/60',
+                      isSelected
+                        ? 'border-indigo-400/70 bg-indigo-500/15 text-white shadow-[0_12px_50px_-30px_rgba(99,102,241,0.9)]'
+                        : 'border-white/10 bg-white/[0.04] text-slate-200 hover:border-indigo-300/40 hover:bg-white/[0.08]',
+                    ].join(' ')}
+                  >
+                    <div className="flex items-center justify-between gap-4">
+                      <div>
+                        <div className="text-sm font-semibold text-white">
+                          {option.city}, {option.country}
+                        </div>
+                        <div className="mt-1 text-xs uppercase tracking-[0.35em] text-slate-400">
+                          {option.provider}
+                        </div>
+                      </div>
+                      <div className="text-right text-xs uppercase tracking-[0.25em]">
+                        <span
+                          className={
+                            remoteConfigured
+                              ? 'text-emerald-300'
+                              : 'text-amber-200'
+                          }
+                        >
+                          {remoteConfigured ? 'Remote Ready' : 'Local Fallback'}
+                        </span>
+                      </div>
+                    </div>
+                    {option.id === 'cloudflare-auto' ? (
+                      <p className="mt-2 text-[0.7rem] leading-5 text-indigo-200/90">
+                        Uses Cloudflare&apos;s public test endpoints. Metrics depend on the
+                        closest Cloudflare PoP reachable from the browser.
+                      </p>
+                    ) : null}
+                    {!remoteConfigured ? (
+                      <p className="mt-2 text-[0.7rem] leading-5 text-amber-100/80">
+                        Provide custom upload/download URLs for this server via code or env
+                        vars before expecting real measurements.
+                      </p>
+                    ) : null}
+                    {isSelected ? (
+                      <div className="mt-3 text-[0.65rem] uppercase tracking-[0.3em] text-indigo-200">
+                        Selected
+                      </div>
+                    ) : null}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
