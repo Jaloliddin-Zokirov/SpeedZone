@@ -1,36 +1,89 @@
 import { NextRequest } from 'next/server';
 import crypto from 'crypto';
+
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-function toInt(v: string | null, def = 5 * 1024 * 1024) {
-  const n = v ? Number(v) : NaN;
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : def;
+
+const DEFAULT_TOTAL_BYTES = 5 * 1024 * 1024;
+const DEFAULT_CHUNK_SIZE = 64 * 1024;
+const MIN_CHUNK_SIZE = 16 * 1024;
+const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
+
+function clampChunkSize(size: number | null) {
+  if (!size || !Number.isFinite(size)) return DEFAULT_CHUNK_SIZE;
+  return Math.min(Math.max(Math.floor(size), MIN_CHUNK_SIZE), MAX_CHUNK_SIZE);
 }
-function randomChunk(size: number) {
-  return crypto.randomBytes(size);
+
+function parsePositiveInt(value: string | null) {
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
 }
-function streamRandomBytes(totalBytes: number, chunkSize = 64 * 1024) {
+
+function makeFixedStream(totalBytes: number, chunkSize: number) {
   let sent = 0;
   return new ReadableStream<Uint8Array>({
     pull(controller) {
-      if (sent >= totalBytes) { controller.close(); return; }
+      if (sent >= totalBytes) {
+        controller.close();
+        return;
+      }
       const remaining = totalBytes - sent;
       const size = Math.min(chunkSize, remaining);
-      const chunk = randomChunk(size);
+      controller.enqueue(crypto.randomBytes(size));
       sent += size;
-      controller.enqueue(chunk);
     },
   });
 }
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const bytes = toInt(searchParams.get('bytes'));
-  const stream = streamRandomBytes(bytes);
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': String(bytes),
-      'Cache-Control': 'no-store',
+
+function makeContinuousStream(chunkSize: number) {
+  let cancelled = false;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (cancelled) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(crypto.randomBytes(chunkSize));
+    },
+    cancel() {
+      cancelled = true;
     },
   });
+}
+
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const rawBytes = searchParams.get('bytes');
+  const chunkSize = clampChunkSize(parsePositiveInt(searchParams.get('chunk')));
+  let totalBytes: number | null = null;
+
+  if (rawBytes == null) {
+    totalBytes = DEFAULT_TOTAL_BYTES;
+  } else {
+    const parsedBytes = parsePositiveInt(rawBytes);
+    if (parsedBytes) {
+      totalBytes = parsedBytes;
+    } else if (rawBytes === '0') {
+      totalBytes = null;
+    } else {
+      totalBytes = DEFAULT_TOTAL_BYTES;
+    }
+  }
+
+  const headers = new Headers({
+    'Content-Type': 'application/octet-stream',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    Pragma: 'no-cache',
+  });
+
+  const stream =
+    totalBytes != null ? makeFixedStream(totalBytes, chunkSize) : makeContinuousStream(chunkSize);
+
+  if (totalBytes != null) {
+    headers.set('Content-Length', String(totalBytes));
+  }
+
+  return new Response(stream, { headers });
 }

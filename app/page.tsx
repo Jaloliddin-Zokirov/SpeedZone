@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 type Phase = 'idle' | 'ping' | 'download' | 'upload' | 'complete' | 'error';
 
@@ -16,11 +16,53 @@ type ServerInfo = {
   provider: string;
 };
 
+const SERVER_POOL: ServerInfo[] = [
+  { city: 'Tashkent', country: 'Uzbekistan', provider: 'Uztelecom' },
+  { city: 'Samarkand', country: 'Uzbekistan', provider: 'UMS Mobile' },
+  { city: 'Namangan', country: 'Uzbekistan', provider: 'Ucell' },
+  { city: 'Almaty', country: 'Kazakhstan', provider: 'Beeline' },
+  { city: 'Frankfurt', country: 'Germany', provider: 'Hetzner' },
+];
+
+type NetworkInfo = {
+  ip: string | null;
+  isp: string | null;
+  org: string | null;
+  city: string | null;
+  region: string | null;
+  country: string | null;
+  timezone: string | null;
+  loading: boolean;
+  error: string | null;
+};
+
+type EndpointInfo = {
+  host: string;
+  colo: string | null;
+  city: string | null;
+  region: string | null;
+  country: string | null;
+  loading: boolean;
+  error: string | null;
+};
+
 type PingProgress = (sampleMs: number, completedSamples: number, totalSamples: number) => void;
 type SpeedProgress = (mbps: number, fraction: number) => void;
 
 const SPEED_SCALES = [25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000];
 
+const DEFAULT_REMOTE_DOWNLOAD_URL = 'https://speed.cloudflare.com/__down';
+const DEFAULT_REMOTE_UPLOAD_URL = 'https://speed.cloudflare.com/__up';
+const DEFAULT_REMOTE_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+
+const REMOTE_DOWNLOAD_URL =
+  process.env.NEXT_PUBLIC_SPEEDTEST_DOWNLOAD_URL ?? DEFAULT_REMOTE_DOWNLOAD_URL;
+const REMOTE_UPLOAD_URL =
+  process.env.NEXT_PUBLIC_SPEEDTEST_UPLOAD_URL ?? DEFAULT_REMOTE_UPLOAD_URL;
+const REMOTE_DOWNLOAD_BYTES = Number(
+  process.env.NEXT_PUBLIC_SPEEDTEST_DOWNLOAD_BYTES ?? DEFAULT_REMOTE_DOWNLOAD_BYTES
+) || DEFAULT_REMOTE_DOWNLOAD_BYTES;
+const REMOTE_DOWNLOAD_HOST = extractHost(REMOTE_DOWNLOAD_URL);
 const STATUS_DETAIL: Record<Phase, string> = {
   idle: 'Click go to verify your connection performance.',
   ping: 'Finding the best route and measuring latency.',
@@ -76,9 +118,27 @@ function gaugeValueText(phase: Phase, value: number) {
   return value.toFixed(2);
 }
 
+function formatLocation(info: Pick<NetworkInfo, 'city' | 'region' | 'country'>) {
+  const parts = [info.city, info.region, info.country].filter((part) => part && part.trim().length > 0);
+  return parts.length ? parts.join(', ') : '—';
+}
+
+const MAX_RANDOM_CHUNK = 65_536;
+
+function extractHost(url: string) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
 function makeRandomPayload(bytes: number) {
   const chunk = new Uint8Array(bytes);
-  crypto.getRandomValues(chunk);
+  for (let offset = 0; offset < chunk.length; offset += MAX_RANDOM_CHUNK) {
+    const end = Math.min(offset + MAX_RANDOM_CHUNK, chunk.length);
+    crypto.getRandomValues(chunk.subarray(offset, end));
+  }
   return chunk;
 }
 
@@ -124,109 +184,362 @@ async function measurePing({
   return { average, jitter, samples: filtered };
 }
 
+async function openDownloadStream(signal: AbortSignal, chunkSize: number) {
+  const cacheBust = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const remoteUrl = new URL(REMOTE_DOWNLOAD_URL);
+  remoteUrl.searchParams.set('bytes', String(REMOTE_DOWNLOAD_BYTES));
+  remoteUrl.searchParams.set('cacheBust', cacheBust);
+  try {
+    const remoteResponse = await fetch(remoteUrl.toString(), { signal, cache: 'no-store' });
+    if (remoteResponse.ok && remoteResponse.body) {
+      return remoteResponse;
+    }
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw err;
+    }
+    console.warn('External download endpoint failed, falling back to local stream.', err);
+  }
+
+  const fallbackUrl = `/api/download?bytes=0&chunk=${chunkSize}&cacheBust=${cacheBust}`;
+  const fallbackResponse = await fetch(fallbackUrl, { signal, cache: 'no-store' });
+  if (!fallbackResponse.ok) {
+    throw new Error(`Download failed with status ${fallbackResponse.status}`);
+  }
+  if (!fallbackResponse.body) {
+    throw new Error('Download stream unavailable');
+  }
+  return fallbackResponse;
+}
+
 async function measureDownload({
-  megabytes = 24,
+  durationMs = 17_000,
   concurrency = 4,
+  chunkSize = 256 * 1024,
   onProgress,
 }: {
-  megabytes?: number;
+  durationMs?: number;
   concurrency?: number;
+  chunkSize?: number;
   onProgress?: SpeedProgress;
 } = {}) {
-  const bytesPerStream = Math.max(1024 * 1024, Math.floor((megabytes * 1024 * 1024) / concurrency));
-  const totalTarget = bytesPerStream * concurrency;
+  const duration = Math.max(Math.floor(durationMs), 1_000);
+  const safeChunkSize = Math.min(
+    Math.max(Math.floor(chunkSize ?? 0) || 256 * 1024, 16 * 1024),
+    1 * 1024 * 1024
+  );
+  const controllers = new Set<AbortController>();
   const start = performance.now();
+  const stopTime = start + duration;
+  let stop = false;
   let totalBytes = 0;
 
-  async function downloadOne() {
-    const res = await fetch(`/api/download?bytes=${bytesPerStream}`, { cache: 'no-store' });
-    if (!res.ok) {
-      throw new Error(`Download failed with status ${res.status}`);
-    }
-    const stream = res.body;
-    if (!stream) throw new Error('Download stream unavailable');
-    const reader = stream.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value) {
-        totalBytes += value.length;
-        const seconds = (performance.now() - start) / 1000;
-        if (seconds > 0) {
-          const mbps = (totalBytes * 8) / 1_000_000 / seconds;
-          onProgress?.(mbps, Math.min(1, totalBytes / totalTarget));
-        }
+  const timer = window.setTimeout(() => {
+    stop = true;
+    const snapshot = Array.from(controllers);
+    snapshot.forEach((controller) => {
+      try {
+        controller.abort();
+      } catch {
+        /* noop */
       }
+    });
+  }, duration);
+
+  function emitProgress() {
+    const now = performance.now();
+    const elapsed = Math.max(now - start, 0);
+    if (elapsed <= 0) return;
+    const seconds = elapsed / 1000;
+    if (seconds <= 0) return;
+    const mbps = (totalBytes * 8) / 1_000_000 / seconds;
+    const fraction = Math.min(1, elapsed / duration);
+    onProgress?.(mbps, fraction);
+  }
+
+  async function runWorker() {
+    if (stop) return;
+    const controller = new AbortController();
+    controllers.add(controller);
+    try {
+      const res = await openDownloadStream(controller.signal, safeChunkSize);
+      const stream = res.body;
+      if (!stream) {
+        throw new Error('Download stream unavailable');
+      }
+      const reader = stream.getReader();
+      try {
+        while (!stop) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) {
+            totalBytes += value.length;
+            emitProgress();
+            if (!stop && performance.now() >= stopTime) {
+              stop = true;
+              const snapshot = Array.from(controllers);
+              snapshot.forEach((ctrl) => {
+                if (ctrl !== controller) {
+                  try {
+                    ctrl.abort();
+                  } catch {
+                    /* noop */
+                  }
+                }
+              });
+              await reader.cancel().catch(() => controller.abort());
+              break;
+            }
+          }
+        }
+      } finally {
+        reader.releaseLock?.();
+      }
+    } catch (err) {
+      const abortError = err instanceof DOMException && err.name === 'AbortError';
+      if (!abortError && !stop) {
+        stop = true;
+        const snapshot = Array.from(controllers);
+        snapshot.forEach((ctrl) => {
+          try {
+            ctrl.abort();
+          } catch {
+            /* noop */
+          }
+        });
+        throw err;
+      }
+    } finally {
+      controllers.delete(controller);
     }
   }
 
-  await Promise.all(Array.from({ length: concurrency }, downloadOne));
-  const seconds = (performance.now() - start) / 1000;
+  try {
+    await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+  } finally {
+    window.clearTimeout(timer);
+    const snapshot = Array.from(controllers);
+    snapshot.forEach((controller) => {
+      try {
+        controller.abort();
+      } catch {
+        /* noop */
+      }
+    });
+    controllers.clear();
+  }
+
+  const elapsedMs = Math.max(performance.now() - start, duration);
+  const seconds = elapsedMs / 1000;
   const mbps = seconds > 0 ? (totalBytes * 8) / 1_000_000 / seconds : 0;
   onProgress?.(mbps, 1);
   return { mbps, bytes: totalBytes, seconds };
 }
 
 async function measureUpload({
-  megabytes = 16,
+  durationMs = 17_000,
   concurrency = 3,
+  payloadBytes = 512 * 1024,
   onProgress,
 }: {
-  megabytes?: number;
+  durationMs?: number;
   concurrency?: number;
+  payloadBytes?: number;
   onProgress?: SpeedProgress;
 } = {}) {
-  const bytesPerStream = Math.max(512 * 1024, Math.floor((megabytes * 1024 * 1024) / concurrency));
-  const totalTarget = bytesPerStream * concurrency;
+  const duration = Math.max(Math.floor(durationMs), 1_000);
+  const chunkBytes = Math.min(
+    Math.max(Math.floor(payloadBytes ?? 0) || 512 * 1024, 128 * 1024),
+    2 * 1024 * 1024
+  );
+  const uploads = new Set<XMLHttpRequest>();
   const start = performance.now();
+  const stopTime = start + duration;
+  let stop = false;
   let totalUploaded = 0;
+  let preferRemoteUpload = true;
 
-  function emit(delta: number) {
-    if (delta <= 0) return;
-    totalUploaded += delta;
-    const seconds = (performance.now() - start) / 1000;
-    if (seconds > 0) {
-      const mbps = (totalUploaded * 8) / 1_000_000 / seconds;
-      onProgress?.(mbps, Math.min(1, totalUploaded / totalTarget));
-    }
+  const timer = window.setTimeout(() => {
+    stop = true;
+    const snapshot = Array.from(uploads);
+    snapshot.forEach((xhr) => {
+      try {
+        xhr.abort();
+      } catch {
+        /* noop */
+      }
+    });
+  }, duration);
+
+  function emitProgress() {
+    const now = performance.now();
+    const elapsed = Math.max(now - start, 0);
+    if (elapsed <= 0) return;
+    const seconds = elapsed / 1000;
+    if (seconds <= 0) return;
+    const mbps = (totalUploaded * 8) / 1_000_000 / seconds;
+    const fraction = Math.min(1, elapsed / duration);
+    onProgress?.(mbps, fraction);
   }
 
-  await Promise.all(
-    Array.from({ length: concurrency }, () => {
-      return new Promise<void>((resolve, reject) => {
-        const payload = makeRandomPayload(bytesPerStream);
+  function runWorker() {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      const complete = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
+      const scheduleNext = () => {
+        if (settled || stop) {
+          complete();
+          return;
+        }
+        dispatchUpload(preferRemoteUpload ? 'remote' : 'local');
+      };
+
+      const dispatchUpload = (mode: 'remote' | 'local') => {
+        if (settled || stop) {
+          complete();
+          return;
+        }
+
+        const payload = makeRandomPayload(chunkBytes);
+        const cacheBust = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const url =
+          mode === 'remote'
+            ? `${REMOTE_UPLOAD_URL}?cacheBust=${cacheBust}`
+            : `/api/upload?cacheBust=${cacheBust}`;
+
         const xhr = new XMLHttpRequest();
+        uploads.add(xhr);
         let lastLoaded = 0;
-        xhr.open('POST', '/api/upload');
-        xhr.responseType = 'json';
-        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+        xhr.open('POST', url);
+        xhr.responseType = 'text';
+
+        const fallbackToLocal = () => {
+          if (settled || stop) {
+            return false;
+          }
+          preferRemoteUpload = false;
+          setTimeout(() => dispatchUpload('local'), 0);
+          return true;
+        };
+
         xhr.upload.onprogress = (event) => {
-          if (!event.lengthComputable) return;
+          if (!event.lengthComputable || stop) return;
           const delta = event.loaded - lastLoaded;
           if (delta > 0) {
             lastLoaded = event.loaded;
-            emit(delta);
+            totalUploaded += delta;
+            emitProgress();
+          }
+          if (!stop && performance.now() >= stopTime) {
+            stop = true;
+          }
+          if (stop) {
+            try {
+              xhr.abort();
+            } catch {
+              /* noop */
+            }
           }
         };
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 400) {
-            const delta = bytesPerStream - lastLoaded;
-            if (delta > 0) emit(delta);
-            resolve();
-          } else {
-            reject(new Error(`Upload failed with status ${xhr.status}`));
-          }
-        };
-        xhr.onerror = () => reject(new Error('Upload request failed'));
-        xhr.send(payload);
-      });
-    })
-  );
 
-  const seconds = (performance.now() - start) / 1000;
-  const mbps = seconds > 0 ? (totalTarget * 8) / 1_000_000 / seconds : 0;
+        xhr.onload = () => {
+          uploads.delete(xhr);
+          if (xhr.status >= 200 && xhr.status < 400) {
+            const remaining = chunkBytes - lastLoaded;
+            if (remaining > 0 && !stop) {
+              totalUploaded += remaining;
+              emitProgress();
+            }
+            if (!stop && performance.now() < stopTime) {
+              setTimeout(scheduleNext, 0);
+            } else {
+              complete();
+            }
+            return;
+          }
+          if (mode === 'remote' && fallbackToLocal()) {
+            return;
+          }
+
+          if (!stop) {
+            stop = true;
+            fail(new Error(`Upload failed with status ${xhr.status}`));
+          } else {
+            complete();
+          }
+        };
+
+        xhr.onerror = () => {
+          uploads.delete(xhr);
+          if (mode === 'remote' && fallbackToLocal()) {
+            return;
+          }
+          if (stop) {
+            complete();
+          } else {
+            stop = true;
+            fail(new Error('Upload request failed'));
+          }
+        };
+
+        xhr.onabort = () => {
+          uploads.delete(xhr);
+          complete();
+        };
+
+        try {
+          xhr.send(payload);
+        } catch (err) {
+          uploads.delete(xhr);
+          if (mode === 'remote' && fallbackToLocal()) {
+            return;
+          }
+          if (!stop) {
+            stop = true;
+            fail(err instanceof Error ? err : new Error(String(err)));
+          } else {
+            complete();
+          }
+        }
+      };
+
+      scheduleNext();
+    });
+  }
+
+  try {
+    await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+  } finally {
+    window.clearTimeout(timer);
+    const snapshot = Array.from(uploads);
+    snapshot.forEach((xhr) => {
+      try {
+        xhr.abort();
+      } catch {
+        /* noop */
+      }
+    });
+    uploads.clear();
+  }
+
+  const elapsedMs = Math.max(performance.now() - start, duration);
+  const seconds = elapsedMs / 1000;
+  const mbps = seconds > 0 ? (totalUploaded * 8) / 1_000_000 / seconds : 0;
   onProgress?.(mbps, 1);
-  return { mbps, bytes: totalTarget, seconds };
+  return { mbps, bytes: totalUploaded, seconds };
 }
 
 function MetricCard({
@@ -373,18 +686,142 @@ export default function Page() {
   const [speedScale, setSpeedScale] = useState(100);
   const [error, setError] = useState<string | null>(null);
   const [durationMs, setDurationMs] = useState(0);
+  const [networkInfo, setNetworkInfo] = useState<NetworkInfo>({
+    ip: null,
+    isp: null,
+    org: null,
+    city: null,
+    region: null,
+    country: null,
+    timezone: null,
+    loading: true,
+    error: null,
+  });
+  const [endpointInfo, setEndpointInfo] = useState<EndpointInfo>({
+    host: REMOTE_DOWNLOAD_HOST,
+    colo: null,
+    city: null,
+    region: null,
+    country: null,
+    loading: REMOTE_DOWNLOAD_HOST.includes('speed.cloudflare.com'),
+    error: null,
+  });
   const runRef = useRef(0);
 
-  const server = useMemo<ServerInfo>(() => {
-    const servers: ServerInfo[] = [
-      { city: 'Tashkent', country: 'Uzbekistan', provider: 'Uztelecom' },
-      { city: 'Samarkand', country: 'Uzbekistan', provider: 'UMS Mobile' },
-      { city: 'Namangan', country: 'Uzbekistan', provider: 'Ucell' },
-      { city: 'Almaty', country: 'Kazakhstan', provider: 'Beeline' },
-      { city: 'Frankfurt', country: 'Germany', provider: 'Hetzner' },
-    ];
-    return servers[Math.floor(Math.random() * servers.length)];
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchNetworkInfo() {
+      try {
+        const response = await fetch(
+          'https://ipwho.is/?fields=success,message,ip,type,city,region,country,connection,timezone',
+          { cache: 'no-store' }
+        );
+        if (!response.ok) {
+          throw new Error(`Lookup failed with status ${response.status}`);
+        }
+        const data = await response.json();
+        if (cancelled) return;
+        if (data.success === false) {
+          setNetworkInfo((prev) => ({
+            ...prev,
+            loading: false,
+            error: data.message ?? 'Unable to detect network information',
+          }));
+          return;
+        }
+        setNetworkInfo({
+          ip: data.ip ?? null,
+          isp: data.connection?.isp ?? data.isp ?? data.org ?? null,
+          org: data.connection?.org ?? data.org ?? null,
+          city: data.city ?? null,
+          region: data.region ?? data.region_name ?? null,
+          country: data.country ?? data.country_name ?? null,
+          timezone: data.timezone?.id ?? data.timezone ?? null,
+          loading: false,
+          error: null,
+        });
+      } catch (err) {
+        if (cancelled) return;
+        setNetworkInfo((prev) => ({
+          ...prev,
+          loading: false,
+          error: err instanceof Error ? err.message : 'Unable to detect network information',
+        }));
+      }
+    }
+    fetchNetworkInfo();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!REMOTE_DOWNLOAD_HOST.includes('speed.cloudflare.com')) {
+      setEndpointInfo((prev) => ({
+        ...prev,
+        loading: false,
+        error: null,
+      }));
+      return () => {
+        cancelled = true;
+      };
+    }
+    async function fetchEndpointMeta() {
+      try {
+        const response = await fetch('https://speed.cloudflare.com/meta', { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`Lookup failed with status ${response.status}`);
+        }
+        const data = await response.json();
+        if (cancelled) return;
+        setEndpointInfo({
+          host: REMOTE_DOWNLOAD_HOST,
+          colo: data.colo ?? null,
+          city: data.city ?? null,
+          region: data.region ?? null,
+          country: data.country ?? null,
+          loading: false,
+          error: null,
+        });
+      } catch (err) {
+        if (cancelled) return;
+        setEndpointInfo((prev) => ({
+          ...prev,
+          loading: false,
+          error:
+            err instanceof Error
+              ? `Unable to resolve Cloudflare test location: ${err.message}`
+              : 'Unable to resolve Cloudflare test location',
+        }));
+      }
+    }
+    fetchEndpointMeta();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const server = useMemo<ServerInfo>(() => {
+    if (endpointInfo.city || endpointInfo.colo || endpointInfo.country) {
+      return {
+        city: endpointInfo.city ?? endpointInfo.colo ?? 'Unknown',
+        country: endpointInfo.country ?? 'Unknown',
+        provider: endpointInfo.host,
+      };
+    }
+    if (networkInfo.country) {
+      const normalized = networkInfo.country.toLowerCase();
+      const match =
+        SERVER_POOL.find((entry) => entry.country.toLowerCase() === normalized) ?? null;
+      if (match) return match;
+    }
+    return {
+      city: 'Unknown',
+      country: 'Unknown',
+      provider: endpointInfo.host,
+    };
+  }, [endpointInfo, networkInfo.country]);
 
   const startTest = useCallback(async () => {
     if (running) return;
@@ -418,8 +855,9 @@ export default function Page() {
 
       setPhase('download');
       const download = await measureDownload({
-        megabytes: 24,
+        durationMs: 17_000,
         concurrency: 4,
+        chunkSize: 256 * 1024,
         onProgress: (mbps, fraction) => {
           if (runRef.current !== runId) return;
           setLiveValue(mbps);
@@ -434,8 +872,9 @@ export default function Page() {
 
       setPhase('upload');
       const upload = await measureUpload({
-        megabytes: 16,
+        durationMs: 17_000,
         concurrency: 3,
+        payloadBytes: 512 * 1024,
         onProgress: (mbps, fraction) => {
           if (runRef.current !== runId) return;
           setLiveValue(mbps);
@@ -516,13 +955,41 @@ export default function Page() {
           <div className="grid gap-3 text-sm text-slate-300 sm:grid-cols-2 sm:items-center">
             <div className="flex items-center gap-2">
               <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(74,222,128,0.8)] animate-pulse" />
-              <span className="uppercase tracking-[0.25em] text-slate-400">Server</span>
+              <span className="uppercase tracking-[0.25em] text-slate-400">Public IP</span>
             </div>
             <div className="font-medium text-white">
-              {server.city}, {server.country}
+              {networkInfo.loading ? 'Detecting...' : networkInfo.ip ?? 'Unavailable'}
             </div>
             <div className="uppercase tracking-[0.25em] text-slate-400">Provider</div>
-            <div className="font-medium text-white">{server.provider}</div>
+            <div className="font-medium text-white">
+              {networkInfo.loading
+                ? 'Detecting...'
+                : networkInfo.isp ?? networkInfo.org ?? 'Unavailable'}
+            </div>
+            <div className="uppercase tracking-[0.25em] text-slate-400">Location</div>
+            <div className="font-medium text-white">
+              {networkInfo.loading
+                ? 'Detecting...'
+                : formatLocation({
+                    city: networkInfo.city,
+                    region: networkInfo.region,
+                    country: networkInfo.country,
+                  })}
+            </div>
+            <div className="uppercase tracking-[0.25em] text-slate-400">Test Server</div>
+            <div className="font-medium text-white">
+              {server.city}, {server.country} - {server.provider}
+            </div>
+            {networkInfo.error ? (
+              <div className="sm:col-span-2 text-xs uppercase tracking-[0.2em] text-amber-200/80">
+                {networkInfo.error}
+              </div>
+            ) : null}
+            {endpointInfo.error ? (
+              <div className="sm:col-span-2 text-xs uppercase tracking-[0.2em] text-amber-200/80">
+                {endpointInfo.error}
+              </div>
+            ) : null}
           </div>
         </header>
 
@@ -585,11 +1052,43 @@ export default function Page() {
               </div>
               <dl className="mt-6 space-y-4 text-sm text-slate-300">
                 <div className="flex justify-between gap-4">
-                  <dt className="uppercase tracking-[0.3em] text-slate-500">Server</dt>
+                  <dt className="uppercase tracking-[0.3em] text-slate-500">Public IP</dt>
                   <dd className="text-right font-medium text-white">
+                    {networkInfo.loading ? 'Detecting...' : networkInfo.ip ?? 'Unavailable'}
+                  </dd>
+                </div>
+                <div className="flex justify-between gap-4">
+                  <dt className="uppercase tracking-[0.3em] text-slate-500">ISP</dt>
+                  <dd className="text-right">
+                    {networkInfo.loading
+                      ? 'Detecting...'
+                      : networkInfo.isp ?? networkInfo.org ?? 'Unavailable'}
+                  </dd>
+                </div>
+                <div className="flex justify-between gap-4">
+                  <dt className="uppercase tracking-[0.3em] text-slate-500">Location</dt>
+                  <dd className="text-right">
+                    {networkInfo.loading
+                      ? 'Detecting...'
+                      : formatLocation({
+                          city: networkInfo.city,
+                          region: networkInfo.region,
+                          country: networkInfo.country,
+                        })}
+                  </dd>
+                </div>
+                <div className="flex justify-between gap-4">
+                  <dt className="uppercase tracking-[0.3em] text-slate-500">Server</dt>
+                  <dd className="text-right">
                     {server.city}, {server.country}
                   </dd>
                 </div>
+                {endpointInfo.colo ? (
+                  <div className="flex justify-between gap-4">
+                    <dt className="uppercase tracking-[0.3em] text-slate-500">Peer Colo</dt>
+                    <dd className="text-right">{endpointInfo.colo}</dd>
+                  </div>
+                ) : null}
                 <div className="flex justify-between gap-4">
                   <dt className="uppercase tracking-[0.3em] text-slate-500">Host</dt>
                   <dd className="text-right">{server.provider}</dd>
