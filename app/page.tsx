@@ -847,13 +847,26 @@ export default function Page() {
         }
         const data = await response.json();
         if (cancelled) return;
+        // Cloudflare's /meta endpoint now returns `colo` as an object
+        // ({ iata, lat, lon, cca2, region, city }) instead of a plain string.
+        // Normalize both shapes so we never render an object as a React child.
+        const coloRaw = data.colo;
+        const coloObject =
+          coloRaw && typeof coloRaw === 'object' ? (coloRaw as Record<string, unknown>) : null;
+        const asStringOrNull = (value: unknown) =>
+          typeof value === 'string' && value.trim().length > 0 ? value : null;
+        const colo = coloObject
+          ? asStringOrNull(coloObject.iata) ?? asStringOrNull(coloObject.city)
+          : asStringOrNull(coloRaw);
         setEndpointInfo((prev) => ({
           ...prev,
           host: selectedHost,
-          colo: data.colo ?? null,
-          city: data.city ?? null,
-          region: data.region ?? null,
-          country: data.country ?? null,
+          colo,
+          city: asStringOrNull(data.city) ?? (coloObject ? asStringOrNull(coloObject.city) : null),
+          region:
+            asStringOrNull(data.region) ?? (coloObject ? asStringOrNull(coloObject.region) : null),
+          country:
+            asStringOrNull(data.country) ?? (coloObject ? asStringOrNull(coloObject.cca2) : null),
           loading: false,
           error: null,
         }));
@@ -1207,6 +1220,131 @@ export default function Page() {
             </div>
           </aside>
         </div>
+
+        <section
+          aria-labelledby="how-it-works-heading"
+          className="rounded-3xl border border-white/10 bg-white/5 p-8 backdrop-blur"
+        >
+          <h2
+            id="how-it-works-heading"
+            className="text-2xl font-semibold tracking-tight text-white sm:text-3xl"
+          >
+            How the SpeedZone internet speed test works
+          </h2>
+          <p className="mt-4 max-w-3xl text-sm leading-7 text-slate-300">
+            SpeedZone is a free, ad-free internet speed test that runs directly in your
+            browser — no app or sign-up required. Press <strong>Go</strong> and SpeedZone measures
+            your connection in three stages, giving you an accurate real-world picture of your
+            broadband, Wi-Fi, or mobile network performance.
+          </p>
+          <ol className="mt-6 grid gap-4 sm:grid-cols-3">
+            <li className="rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+              <h3 className="text-sm font-semibold uppercase tracking-[0.3em] text-indigo-200">
+                1. Ping &amp; Jitter
+              </h3>
+              <p className="mt-3 text-sm leading-6 text-slate-300">
+                We send repeated lightweight requests to find your latency (ping) and how stable it
+                is (jitter) — the numbers that matter most for gaming and video calls.
+              </p>
+            </li>
+            <li className="rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+              <h3 className="text-sm font-semibold uppercase tracking-[0.3em] text-indigo-200">
+                2. Download
+              </h3>
+              <p className="mt-3 text-sm leading-6 text-slate-300">
+                Multiple parallel connections stream data from nearby test servers to measure how
+                fast you can receive data, in megabits per second (Mbps).
+              </p>
+            </li>
+            <li className="rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+              <h3 className="text-sm font-semibold uppercase tracking-[0.3em] text-indigo-200">
+                3. Upload
+              </h3>
+              <p className="mt-3 text-sm leading-6 text-slate-300">
+                We push data upstream over several threads to measure your upload capacity —
+                important for video calls, cloud backups, and live streaming.
+              </p>
+            </li>
+          </ol>
+        </section>
+
+        <section
+          aria-labelledby="why-heading"
+          className="rounded-3xl border border-white/10 bg-white/5 p-8 backdrop-blur"
+        >
+          <h2
+            id="why-heading"
+            className="text-2xl font-semibold tracking-tight text-white sm:text-3xl"
+          >
+            Why choose SpeedZone
+          </h2>
+          <ul className="mt-6 grid gap-3 text-sm leading-6 text-slate-300 sm:grid-cols-2">
+            <li>✓ 100% free with no ads and no sign-up</li>
+            <li>✓ Accurate multi-threaded download &amp; upload measurement</li>
+            <li>✓ Real ping and jitter, not just bandwidth</li>
+            <li>✓ Detects your public IP, ISP and location automatically</li>
+            <li>✓ Choose the test server closest to you</li>
+            <li>✓ Fast, modern interface that works on any device</li>
+          </ul>
+        </section>
+
+        <section
+          aria-labelledby="faq-heading"
+          className="rounded-3xl border border-white/10 bg-white/5 p-8 backdrop-blur"
+        >
+          <h2
+            id="faq-heading"
+            className="text-2xl font-semibold tracking-tight text-white sm:text-3xl"
+          >
+            Frequently asked questions
+          </h2>
+          <div className="mt-6 space-y-5">
+            <details className="group rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+              <summary className="cursor-pointer text-base font-medium text-white">
+                How does SpeedZone measure my internet speed?
+              </summary>
+              <p className="mt-3 text-sm leading-6 text-slate-300">
+                SpeedZone runs the test directly in your browser. It first measures ping and jitter
+                with repeated lightweight requests, then measures download and upload throughput
+                using multiple parallel connections to nearby Cloudflare test endpoints, giving an
+                accurate picture of your real-world connection speed.
+              </p>
+            </details>
+            <details className="group rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+              <summary className="cursor-pointer text-base font-medium text-white">
+                Is SpeedZone free to use?
+              </summary>
+              <p className="mt-3 text-sm leading-6 text-slate-300">
+                Yes. SpeedZone is completely free, requires no sign-up, and has no ads. Just open the
+                page and press Go.
+              </p>
+            </details>
+            <details className="group rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+              <summary className="cursor-pointer text-base font-medium text-white">
+                What is a good internet speed?
+              </summary>
+              <p className="mt-3 text-sm leading-6 text-slate-300">
+                For HD streaming and browsing, 25 Mbps download is comfortable. For 4K streaming,
+                video calls and multiple devices, 100 Mbps or more is recommended. Lower ping (under
+                30 ms) and low jitter matter most for gaming and video calls.
+              </p>
+            </details>
+            <details className="group rounded-2xl border border-white/10 bg-white/[0.03] p-5">
+              <summary className="cursor-pointer text-base font-medium text-white">
+                What is the difference between ping, download and upload?
+              </summary>
+              <p className="mt-3 text-sm leading-6 text-slate-300">
+                Ping (latency) is how quickly your connection responds, measured in milliseconds.
+                Download speed is how fast you receive data. Upload speed is how fast you send data.
+                All three are measured in a single SpeedZone test.
+              </p>
+            </details>
+          </div>
+        </section>
+
+        <footer className="pb-4 text-center text-xs uppercase tracking-[0.3em] text-slate-500">
+          SpeedZone — free internet speed test · ping, download &amp; upload
+        </footer>
       </div>
       {isServerPickerOpen ? (
         <div
