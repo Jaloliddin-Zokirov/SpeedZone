@@ -209,47 +209,17 @@ async function measurePing({
   return { average, jitter, samples: filtered };
 }
 
-async function openDownloadStream(
-  signal: AbortSignal,
-  chunkSize: number,
-  remoteUrl: string | null | undefined,
-  remoteBytes: number
-) {
-  const cacheBust = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const remoteTarget = remoteUrl?.trim().length ? remoteUrl.trim() : null;
-
-  if (remoteTarget) {
-    try {
-      const inbound = new URL(remoteTarget);
-      inbound.searchParams.set('bytes', String(remoteBytes));
-      inbound.searchParams.set('cacheBust', cacheBust);
-      const remoteResponse = await fetch(inbound.toString(), { signal, cache: 'no-store' });
-      if (remoteResponse.ok && remoteResponse.body) {
-        return remoteResponse;
-      }
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw err;
-      }
-      console.warn('External download endpoint failed, falling back to local stream.', err);
-    }
-  }
-
-  const fallbackUrl = `/api/download?bytes=0&chunk=${chunkSize}&cacheBust=${cacheBust}`;
-  const fallbackResponse = await fetch(fallbackUrl, { signal, cache: 'no-store' });
-  if (!fallbackResponse.ok) {
-    throw new Error(`Download failed with status ${fallbackResponse.status}`);
-  }
-  if (!fallbackResponse.body) {
-    throw new Error('Download stream unavailable');
-  }
-  return fallbackResponse;
-}
-
+// Download uses the same XMLHttpRequest-based architecture as measureUpload
+// below: bounded requests, onprogress-driven byte counting, a built-in
+// per-request timeout, and automatic per-request fallback to the local
+// endpoint. Streaming fetch + ReadableStream reads were tried first but
+// proved unreliable across real-world networks (a stalled read could hang
+// indefinitely); XHR's onprogress/timeout events are simpler and battle
+// tested here by the upload path already working smoothly.
 async function measureDownload({
   durationMs = 17_000,
   concurrency = 4,
-  chunkSize = 256 * 1024,
+  chunkSize = 4 * 1024 * 1024,
   remoteUrl,
   remoteBytes = DEFAULT_REMOTE_DOWNLOAD_BYTES,
   onProgress,
@@ -262,26 +232,32 @@ async function measureDownload({
   onProgress?: SpeedProgress;
 } = {}) {
   const duration = Math.max(Math.floor(durationMs), 1_000);
-  const safeChunkSize = Math.min(
-    Math.max(Math.floor(chunkSize ?? 0) || 256 * 1024, 16 * 1024),
-    1 * 1024 * 1024
+  const requestBytes = Math.min(
+    Math.max(Math.floor(chunkSize ?? 0) || 4 * 1024 * 1024, 512 * 1024),
+    8 * 1024 * 1024
   );
-  const controllers = new Set<AbortController>();
+  const xhrs = new Set<XMLHttpRequest>();
   const start = performance.now();
   const stopTime = start + duration;
   let stop = false;
   let totalBytes = 0;
+  const remoteEndpoint = remoteUrl?.trim().length ? remoteUrl.trim() : null;
+  let preferRemoteDownload = Boolean(remoteEndpoint);
 
-  const timer = window.setTimeout(() => {
-    stop = true;
-    const snapshot = Array.from(controllers);
-    snapshot.forEach((controller) => {
+  function abortAll() {
+    const snapshot = Array.from(xhrs);
+    snapshot.forEach((xhr) => {
       try {
-        controller.abort();
+        xhr.abort();
       } catch {
         /* noop */
       }
     });
+  }
+
+  const timer = window.setTimeout(() => {
+    stop = true;
+    abortAll();
   }, duration);
 
   function emitProgress() {
@@ -295,79 +271,177 @@ async function measureDownload({
     onProgress?.(mbps, fraction);
   }
 
-  async function runWorker() {
-    if (stop) return;
-    const controller = new AbortController();
-    controllers.add(controller);
-    try {
-      const res = await openDownloadStream(controller.signal, safeChunkSize, remoteUrl, remoteBytes);
-      const stream = res.body;
-      if (!stream) {
-        throw new Error('Download stream unavailable');
-      }
-      const reader = stream.getReader();
-      try {
-        while (!stop) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (value) {
-            totalBytes += value.length;
-            emitProgress();
-            if (!stop && performance.now() >= stopTime) {
-              stop = true;
-              const snapshot = Array.from(controllers);
-              snapshot.forEach((ctrl) => {
-                if (ctrl !== controller) {
-                  try {
-                    ctrl.abort();
-                  } catch {
-                    /* noop */
-                  }
-                }
-              });
-              await reader.cancel().catch(() => controller.abort());
-              break;
+  function runWorker() {
+    return new Promise<void>((resolve) => {
+      let settled = false;
+
+      const complete = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+
+      const scheduleNext = () => {
+        if (settled || stop || performance.now() >= stopTime) {
+          complete();
+          return;
+        }
+        dispatchDownload(preferRemoteDownload ? 'remote' : 'local');
+      };
+
+      const dispatchDownload = (mode: 'remote' | 'local') => {
+        if (settled || stop) {
+          complete();
+          return;
+        }
+        if (mode === 'remote' && !remoteEndpoint) {
+          setTimeout(() => dispatchDownload('local'), 0);
+          return;
+        }
+
+        const cacheBust = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        let url: string;
+        if (mode === 'remote' && remoteEndpoint) {
+          try {
+            const inbound = new URL(remoteEndpoint);
+            inbound.searchParams.set('bytes', String(requestBytes));
+            inbound.searchParams.set('cacheBust', cacheBust);
+            url = inbound.toString();
+          } catch {
+            setTimeout(() => dispatchDownload('local'), 0);
+            return;
+          }
+        } else {
+          url = `/api/download?bytes=${requestBytes}&chunk=${requestBytes}&cacheBust=${cacheBust}`;
+        }
+
+        const xhr = new XMLHttpRequest();
+        xhrs.add(xhr);
+        let lastLoaded = 0;
+
+        xhr.open('GET', url);
+        xhr.responseType = 'arraybuffer';
+        // A per-request timeout stands in for stall detection: a connection
+        // that stops delivering data is abandoned and replaced with a fresh
+        // one instead of hanging for the rest of the test.
+        xhr.timeout = 8000;
+
+        const fallbackToLocal = () => {
+          if (settled || stop) {
+            return false;
+          }
+          preferRemoteDownload = false;
+          setTimeout(() => dispatchDownload('local'), 0);
+          return true;
+        };
+
+        xhr.onprogress = (event) => {
+          if (stop) return;
+          if (event.lengthComputable) {
+            const delta = event.loaded - lastLoaded;
+            if (delta > 0) {
+              lastLoaded = event.loaded;
+              totalBytes += delta;
+              emitProgress();
             }
           }
-        }
-      } finally {
-        reader.releaseLock?.();
-      }
-    } catch (err) {
-      const abortError = err instanceof DOMException && err.name === 'AbortError';
-      if (!abortError && !stop) {
-        stop = true;
-        const snapshot = Array.from(controllers);
-        snapshot.forEach((ctrl) => {
-          try {
-            ctrl.abort();
-          } catch {
-            /* noop */
+          if (!stop && performance.now() >= stopTime) {
+            stop = true;
           }
-        });
-        throw err;
-      }
-    } finally {
-      controllers.delete(controller);
-    }
+          if (stop) {
+            try {
+              xhr.abort();
+            } catch {
+              /* noop */
+            }
+          }
+        };
+
+        xhr.onload = () => {
+          xhrs.delete(xhr);
+          if (xhr.status >= 200 && xhr.status < 400) {
+            const body = xhr.response as ArrayBuffer | null;
+            const total = body ? body.byteLength : lastLoaded;
+            const remaining = total - lastLoaded;
+            if (remaining > 0 && !stop) {
+              totalBytes += remaining;
+              emitProgress();
+            }
+            if (!stop && performance.now() < stopTime) {
+              setTimeout(scheduleNext, 0);
+            } else {
+              complete();
+            }
+            return;
+          }
+          if (mode === 'remote' && fallbackToLocal()) {
+            return;
+          }
+          complete();
+        };
+
+        xhr.ontimeout = () => {
+          xhrs.delete(xhr);
+          if (mode === 'remote' && fallbackToLocal()) {
+            return;
+          }
+          if (!stop && performance.now() < stopTime) {
+            setTimeout(scheduleNext, 0);
+          } else {
+            complete();
+          }
+        };
+
+        xhr.onerror = () => {
+          xhrs.delete(xhr);
+          if (mode === 'remote' && fallbackToLocal()) {
+            return;
+          }
+          if (!stop && performance.now() < stopTime) {
+            setTimeout(scheduleNext, 0);
+          } else {
+            complete();
+          }
+        };
+
+        xhr.onabort = () => {
+          xhrs.delete(xhr);
+          complete();
+        };
+
+        try {
+          xhr.send();
+        } catch {
+          xhrs.delete(xhr);
+          if (mode === 'remote' && fallbackToLocal()) {
+            return;
+          }
+          complete();
+        }
+      };
+
+      scheduleNext();
+    });
   }
 
   try {
-    await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
-  } finally {
-    window.clearTimeout(timer);
-    const snapshot = Array.from(controllers);
-    snapshot.forEach((controller) => {
-      try {
-        controller.abort();
-      } catch {
-        /* noop */
-      }
+    const workers = Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+    // Hard safety deadline: xhr.abort() does not reliably fire onabort for
+    // every in-flight cross-origin request, which can leave a single worker's
+    // promise unresolved forever. This guarantees the measurement always
+    // returns within duration + a grace window regardless.
+    const guard = new Promise<void>((resolve) => {
+      window.setTimeout(resolve, duration + 4000);
     });
-    controllers.clear();
+    await Promise.race([workers, guard]);
+  } finally {
+    stop = true;
+    window.clearTimeout(timer);
+    abortAll();
+    xhrs.clear();
   }
 
-  const elapsedMs = Math.max(performance.now() - start, duration);
+  const elapsedMs = Math.max(performance.now() - start, 1);
   const seconds = elapsedMs / 1000;
   const mbps = seconds > 0 ? (totalBytes * 8) / 1_000_000 / seconds : 0;
   onProgress?.(mbps, 1);
@@ -397,11 +471,12 @@ async function measureUpload({
   const stopTime = start + duration;
   let stop = false;
   let totalUploaded = 0;
+  let lastAdvanceAt = start;
+  let lastAdvanceBytes = 0;
   const remoteEndpoint = remoteUrl?.trim().length ? remoteUrl.trim() : null;
   let preferRemoteUpload = Boolean(remoteEndpoint);
 
-  const timer = window.setTimeout(() => {
-    stop = true;
+  function abortAll() {
     const snapshot = Array.from(uploads);
     snapshot.forEach((xhr) => {
       try {
@@ -410,10 +485,28 @@ async function measureUpload({
         /* noop */
       }
     });
+  }
+
+  const timer = window.setTimeout(() => {
+    stop = true;
+    abortAll();
   }, duration);
+
+  const STALL_MS = 6000;
+  const stallTimer = window.setInterval(() => {
+    if (stop) return;
+    if (performance.now() - lastAdvanceAt > STALL_MS) {
+      stop = true;
+      abortAll();
+    }
+  }, 1000);
 
   function emitProgress() {
     const now = performance.now();
+    if (totalUploaded > lastAdvanceBytes) {
+      lastAdvanceBytes = totalUploaded;
+      lastAdvanceAt = now;
+    }
     const elapsed = Math.max(now - start, 0);
     if (elapsed <= 0) return;
     const seconds = elapsed / 1000;
@@ -566,25 +659,128 @@ async function measureUpload({
   }
 
   try {
-    await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
-  } finally {
-    window.clearTimeout(timer);
-    const snapshot = Array.from(uploads);
-    snapshot.forEach((xhr) => {
-      try {
-        xhr.abort();
-      } catch {
-        /* noop */
-      }
+    const workers = Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+    const guard = new Promise<void>((resolve) => {
+      window.setTimeout(resolve, duration + 3000);
     });
+    await Promise.race([workers, guard]);
+  } finally {
+    stop = true;
+    window.clearTimeout(timer);
+    window.clearInterval(stallTimer);
+    abortAll();
     uploads.clear();
   }
 
-  const elapsedMs = Math.max(performance.now() - start, duration);
+  const elapsedMs = Math.max(performance.now() - start, 1);
   const seconds = elapsedMs / 1000;
   const mbps = seconds > 0 ? (totalUploaded * 8) / 1_000_000 / seconds : 0;
   onProgress?.(mbps, 1);
   return { mbps, bytes: totalUploaded, seconds };
+}
+
+type MetricAccent = 'ping' | 'jitter' | 'download' | 'upload';
+
+const METRIC_ACCENTS: Record<
+  MetricAccent,
+  { text: string; bar: string; ring: string; glow: string; softBg: string }
+> = {
+  ping: {
+    text: 'text-cyan-300',
+    bar: 'from-cyan-400 to-sky-500',
+    ring: 'border-cyan-400/60',
+    glow: '0 12px 60px -30px rgba(34,211,238,0.85)',
+    softBg: 'bg-cyan-400/10',
+  },
+  jitter: {
+    text: 'text-violet-300',
+    bar: 'from-violet-400 to-purple-500',
+    ring: 'border-violet-400/60',
+    glow: '0 12px 60px -30px rgba(167,139,250,0.85)',
+    softBg: 'bg-violet-400/10',
+  },
+  download: {
+    text: 'text-emerald-300',
+    bar: 'from-emerald-400 to-teal-500',
+    ring: 'border-emerald-400/60',
+    glow: '0 12px 60px -30px rgba(52,211,153,0.85)',
+    softBg: 'bg-emerald-400/10',
+  },
+  upload: {
+    text: 'text-fuchsia-300',
+    bar: 'from-fuchsia-400 to-pink-500',
+    ring: 'border-fuchsia-400/60',
+    glow: '0 12px 60px -30px rgba(232,121,249,0.85)',
+    softBg: 'bg-fuchsia-400/10',
+  },
+};
+
+function MetricIcon({ accent, className }: { accent: MetricAccent; className?: string }) {
+  const common = {
+    className,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.8,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+  };
+  if (accent === 'download') {
+    return (
+      <svg {...common}>
+        <path d="M12 3v12" />
+        <path d="m7 11 5 5 5-5" />
+        <path d="M5 21h14" />
+      </svg>
+    );
+  }
+  if (accent === 'upload') {
+    return (
+      <svg {...common}>
+        <path d="M12 21V9" />
+        <path d="m7 13 5-5 5 5" />
+        <path d="M5 3h14" />
+      </svg>
+    );
+  }
+  if (accent === 'jitter') {
+    return (
+      <svg {...common}>
+        <path d="M2 12h3l3 7 4-16 3 12 2-5h5" />
+      </svg>
+    );
+  }
+  // ping
+  return (
+    <svg {...common}>
+      <path d="M2 12h5l2 5 4-12 2 9 2-4h5" />
+    </svg>
+  );
+}
+
+function StatusPill({ status }: { status: string }) {
+  const styles =
+    status === 'TESTING' || status === 'CALC'
+      ? 'border-amber-300/40 bg-amber-300/10 text-amber-200'
+      : status === 'COMPLETE'
+      ? 'border-emerald-400/40 bg-emerald-400/10 text-emerald-200'
+      : status === 'ERROR'
+      ? 'border-rose-400/40 bg-rose-400/10 text-rose-200'
+      : 'border-white/10 bg-white/5 text-slate-400';
+  const pulsing = status === 'TESTING' || status === 'CALC';
+  return (
+    <span
+      className={[
+        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[0.6rem] font-semibold uppercase tracking-[0.2em]',
+        styles,
+      ].join(' ')}
+    >
+      {pulsing ? (
+        <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" />
+      ) : null}
+      {status}
+    </span>
+  );
 }
 
 function MetricCard({
@@ -594,6 +790,7 @@ function MetricCard({
   status,
   progress,
   active,
+  accent,
 }: {
   label: string;
   value: string;
@@ -601,31 +798,65 @@ function MetricCard({
   status: string;
   progress?: number;
   active?: boolean;
+  accent: MetricAccent;
 }) {
   const showProgress = progress != null && progress < 0.995;
+  const theme = METRIC_ACCENTS[accent];
+  const hasValue = value !== '—';
   return (
     <div
       className={[
-        'relative overflow-hidden rounded-2xl border border-white/10 bg-white/5 p-5 shadow-[0_24px_70px_-55px_rgba(15,23,42,0.9)] transition-shadow duration-300',
-        active ? 'border-indigo-400/60 shadow-[0_12px_70px_-30px_rgba(99,102,241,0.9)]' : '',
+        'group relative overflow-hidden rounded-2xl border bg-white/5 p-5 transition-all duration-300',
+        active
+          ? theme.ring
+          : 'border-white/10 shadow-[0_24px_70px_-55px_rgba(15,23,42,0.9)]',
       ].join(' ')}
+      style={active ? { boxShadow: theme.glow } : undefined}
     >
-      <div className="flex items-center justify-between">
-        <span className="text-xs uppercase tracking-[0.35em] text-slate-400">{label}</span>
-        <span className="text-[0.65rem] uppercase tracking-[0.25em] text-slate-500">{status}</span>
+      {active ? (
+        <div
+          className={`pointer-events-none absolute -right-6 -top-6 h-24 w-24 rounded-full ${theme.softBg} blur-2xl`}
+        />
+      ) : null}
+      <div className="relative flex items-center justify-between">
+        <span className="flex items-center gap-2 text-xs uppercase tracking-[0.35em] text-slate-400">
+          <span
+            className={[
+              'flex h-7 w-7 items-center justify-center rounded-lg border border-white/10 transition-colors',
+              active ? `${theme.softBg} ${theme.text}` : 'text-slate-500',
+            ].join(' ')}
+          >
+            <MetricIcon accent={accent} className="h-4 w-4" />
+          </span>
+          {label}
+        </span>
+        <StatusPill status={status} />
       </div>
-      <div className="mt-4 flex items-end gap-2">
-        <span className="text-3xl font-semibold text-white">{value}</span>
+      <div className="relative mt-4 flex items-end gap-2">
+        <span
+          className={[
+            'text-3xl font-semibold tabular-nums transition-colors',
+            hasValue ? 'text-white' : 'text-slate-600',
+          ].join(' ')}
+        >
+          {value}
+        </span>
         <span className="pb-1 text-sm text-slate-400">{unit}</span>
       </div>
-      {showProgress ? (
-        <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-slate-800/70">
-          <div
-            className="h-full rounded-full bg-gradient-to-r from-indigo-500 via-sky-500 to-fuchsia-500 transition-[width] duration-200 ease-out"
-            style={{ width: `${Math.max(progress ?? 0, 0.04) * 100}%` }}
-          />
-        </div>
-      ) : null}
+      <div className="relative mt-4 h-1.5 w-full overflow-hidden rounded-full bg-slate-800/70">
+        <div
+          className={`h-full rounded-full bg-gradient-to-r ${theme.bar} transition-[width] duration-200 ease-out`}
+          style={{
+            width: `${
+              showProgress
+                ? Math.max(progress ?? 0, 0.04) * 100
+                : hasValue
+                ? 100
+                : 0
+            }%`,
+          }}
+        />
+      </div>
     </div>
   );
 }
@@ -654,18 +885,36 @@ function SpeedGauge({
   error: string | null;
 }) {
   const ratio = max > 0 ? Math.max(0, Math.min(value / max, 1)) : 0;
-  const angle = -135 + ratio * 270;
   const buttonLabel = phase === 'complete' ? 'Go Again' : phase === 'error' ? 'Retry' : 'Go';
+
+  // The gauge picks up the colour of the metric currently being measured so
+  // the whole test reads as one system with the metric cards below.
+  const accent =
+    phase === 'ping'
+      ? { arc: 'rgba(34,211,238,0.9)', glow: 'rgba(34,211,238,0.4)', text: 'text-cyan-200', label: 'Ping' }
+      : phase === 'download'
+      ? { arc: 'rgba(52,211,153,0.9)', glow: 'rgba(52,211,153,0.4)', text: 'text-emerald-200', label: 'Download' }
+      : phase === 'upload' || phase === 'complete'
+      ? { arc: 'rgba(232,121,249,0.9)', glow: 'rgba(232,121,249,0.4)', text: 'text-fuchsia-200', label: phase === 'complete' ? 'Upload' : 'Upload' }
+      : phase === 'error'
+      ? { arc: 'rgba(251,113,133,0.9)', glow: 'rgba(251,113,133,0.35)', text: 'text-rose-200', label: 'Error' }
+      : { arc: 'rgba(99,102,241,0.85)', glow: 'rgba(79,70,229,0.35)', text: 'text-indigo-200', label: 'Ready' };
 
   return (
     <div className="relative flex w-full flex-col items-center">
-      <div className="pointer-events-none absolute inset-0 -z-10 rounded-full bg-[radial-gradient(circle_at_50%_20%,rgba(129,140,248,0.25),transparent_65%)]" />
+      <div
+        className="pointer-events-none absolute inset-0 -z-10 rounded-full transition-colors duration-500"
+        style={{ background: `radial-gradient(circle at 50% 20%, ${accent.glow}, transparent 65%)` }}
+      />
       <div className="relative aspect-square w-full max-w-[24rem]">
-        <div className="absolute inset-0 rounded-full border border-white/10 bg-gradient-to-br from-slate-900 via-slate-950 to-black shadow-[0_0_120px_rgba(79,70,229,0.35)]" />
         <div
-          className="absolute inset-[12%] rounded-full border border-white/5"
+          className="absolute inset-0 rounded-full border border-white/10 bg-gradient-to-br from-slate-900 via-slate-950 to-black transition-shadow duration-500"
+          style={{ boxShadow: `0 0 120px ${accent.glow}` }}
+        />
+        <div
+          className="absolute inset-[12%] rounded-full border border-white/5 transition-[background] duration-200"
           style={{
-            background: `conic-gradient(from 225deg, rgba(99,102,241,0.85) ${ratio * 100}%, rgba(100,116,139,0.14) ${ratio * 100}% 100%)`,
+            background: `conic-gradient(from 225deg, ${accent.arc} ${ratio * 100}%, rgba(100,116,139,0.14) ${ratio * 100}% 100%)`,
           }}
         />
         <div className="absolute inset-[22%] rounded-full bg-slate-950/80 backdrop-blur-md">
@@ -682,8 +931,11 @@ function SpeedGauge({
               <span className="text-xs uppercase tracking-[0.35em] text-slate-500">SpeedZone</span>
             </button>
           ) : (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2">
-              <span className="text-6xl font-semibold tracking-tight text-white drop-shadow-sm">
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
+              <span className={`text-xs font-semibold uppercase tracking-[0.4em] ${accent.text}`}>
+                {accent.label}
+              </span>
+              <span className="text-6xl font-semibold tabular-nums tracking-tight text-white drop-shadow-sm">
                 {gaugeValueText(phase === 'complete' ? 'upload' : phase, value)}
               </span>
               <span className="text-sm uppercase tracking-[0.45em] text-slate-400">{unit}</span>
@@ -939,38 +1191,73 @@ export default function Page() {
       setLiveValue(ping.average);
 
       setPhase('download');
-      const download = await measureDownload({
+      const downloadOnProgress = (mbps: number, fraction: number) => {
+        if (runRef.current !== runId) return;
+        setLiveValue(mbps);
+        setSpeedScale((prev) => adjustSpeedScale(prev, mbps));
+        setProgress((prev) => ({ ...prev, download: fraction }));
+      };
+      let download = await measureDownload({
         durationMs: 17_000,
         concurrency: 4,
         chunkSize: 256 * 1024,
         remoteUrl: selectedDownloadUrl,
         remoteBytes: selectedDownloadBytes,
-        onProgress: (mbps, fraction) => {
-          if (runRef.current !== runId) return;
-          setLiveValue(mbps);
-          setSpeedScale((prev) => adjustSpeedScale(prev, mbps));
-          setProgress((prev) => ({ ...prev, download: fraction }));
-        },
+        onProgress: downloadOnProgress,
       });
       if (runRef.current !== runId) return;
+      // If the remote endpoint yielded no data (aborted/blocked connection),
+      // fall back to the local streaming endpoint so a completed test never
+      // reports an empty "—" result.
+      if (!(download.mbps > 0) || download.bytes === 0) {
+        setProgress((prev) => ({ ...prev, download: 0 }));
+        const localDownload = await measureDownload({
+          durationMs: 12_000,
+          concurrency: 4,
+          chunkSize: 256 * 1024,
+          remoteUrl: null,
+          onProgress: downloadOnProgress,
+        });
+        if (runRef.current !== runId) return;
+        if (localDownload.mbps > download.mbps) {
+          download = localDownload;
+        }
+      }
       setResults((prev) => ({ ...prev, download: download.mbps }));
       setProgress((prev) => ({ ...prev, download: 1 }));
       setLiveValue(download.mbps);
 
       setPhase('upload');
-      const upload = await measureUpload({
+      const uploadOnProgress = (mbps: number, fraction: number) => {
+        if (runRef.current !== runId) return;
+        setLiveValue(mbps);
+        setSpeedScale((prev) => adjustSpeedScale(prev, mbps));
+        setProgress((prev) => ({ ...prev, upload: fraction }));
+      };
+      let upload = await measureUpload({
         durationMs: 17_000,
         concurrency: 3,
         payloadBytes: 512 * 1024,
         remoteUrl: selectedUploadUrl,
-        onProgress: (mbps, fraction) => {
-          if (runRef.current !== runId) return;
-          setLiveValue(mbps);
-          setSpeedScale((prev) => adjustSpeedScale(prev, mbps));
-          setProgress((prev) => ({ ...prev, upload: fraction }));
-        },
+        onProgress: uploadOnProgress,
       });
       if (runRef.current !== runId) return;
+      // Same safeguard for upload: fall back to the local endpoint if the
+      // remote upload produced no measurable data.
+      if (!(upload.mbps > 0) || upload.bytes === 0) {
+        setProgress((prev) => ({ ...prev, upload: 0 }));
+        const localUpload = await measureUpload({
+          durationMs: 12_000,
+          concurrency: 3,
+          payloadBytes: 512 * 1024,
+          remoteUrl: null,
+          onProgress: uploadOnProgress,
+        });
+        if (runRef.current !== runId) return;
+        if (localUpload.mbps > upload.mbps) {
+          upload = localUpload;
+        }
+      }
       setResults((prev) => ({ ...prev, upload: upload.mbps }));
       setProgress((prev) => ({ ...prev, upload: 1 }));
       setLiveValue(upload.mbps);
@@ -1118,6 +1405,7 @@ export default function Page() {
             <div className="grid w-full gap-4 sm:grid-cols-2">
               <MetricCard
                 label="PING"
+                accent="ping"
                 value={formatLatency(results.ping)}
                 unit="ms"
                 status={pingStatus}
@@ -1126,6 +1414,7 @@ export default function Page() {
               />
               <MetricCard
                 label="JITTER"
+                accent="jitter"
                 value={formatLatency(results.jitter)}
                 unit="ms"
                 status={jitterStatus}
@@ -1134,6 +1423,7 @@ export default function Page() {
               />
               <MetricCard
                 label="DOWNLOAD"
+                accent="download"
                 value={formatSpeed(results.download)}
                 unit="Mbps"
                 status={downloadStatus}
@@ -1142,6 +1432,7 @@ export default function Page() {
               />
               <MetricCard
                 label="UPLOAD"
+                accent="upload"
                 value={formatSpeed(results.upload)}
                 unit="Mbps"
                 status={uploadStatus}
